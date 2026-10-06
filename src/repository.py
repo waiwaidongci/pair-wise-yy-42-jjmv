@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import DERIVED_KINDS, RECORD_STATUSES, STATES
 
 
 class Repository:
@@ -21,9 +21,11 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._migrate_records()
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        record_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in RECORD_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -48,11 +50,26 @@ class Repository:
                     kind TEXT NOT NULL,
                     detail TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open'
-                        CHECK(status IN ('open','closed')),
+                        CHECK(status IN ({record_statuses})),
                     external_ref TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS rollback_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_no TEXT NOT NULL UNIQUE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    expected_version INTEGER NOT NULL,
+                    target_status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','committed','aborted')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    committed_at TEXT,
+                    result_version INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +83,38 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+
+    def _migrate_records(self) -> None:
+        """旧记录没有版本号时迁移成首版，并放开 voided 状态约束。"""
+        with self._lock, self.conn:
+            cols = self.conn.execute("PRAGMA table_info(records)").fetchall()
+            col_names = [c[1] for c in cols]
+            if "version" in col_names:
+                return
+            # 旧表缺少 version 列，且 CHECK 未包含 voided；整表重建以迁移
+            self.conn.execute("ALTER TABLE records RENAME TO records_old")
+            self.conn.execute(f"""
+                CREATE TABLE records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ({','.join("'" + s.replace("'", "''") + "'" for s in RECORD_STATUSES)})),
+                    external_ref TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                )
+            """)
+            self.conn.execute(
+                """INSERT INTO records(id, item_id, kind, detail, status, external_ref,
+                   version, created_by, created_at)
+                   SELECT id, item_id, kind, detail, status, external_ref, 1,
+                          created_by, created_at FROM records_old"""
+            )
+            self.conn.execute("DROP TABLE records_old")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -120,8 +169,102 @@ class Repository:
                 exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
                 if exists is None:
                     raise NotFoundError("项目不存在")
-                raise ConflictError("版本冲突，请刷新后重试")
+                row = self.conn.execute(
+                    "SELECT version FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                raise ConflictError(
+                    f"版本冲突，当前版本为{row['version']}，请刷新后重试")
         return self.get_item(item_id)
+
+    def create_rollback_request(self, request_no: str, item_id: int,
+                                 expected_version: int, target: str, reason: str,
+                                 actor: str) -> None:
+        """建立检查点（pending）。请求编号唯一，重复提交不重复落账。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO rollback_requests
+                   (request_no, item_id, expected_version, target_status, reason,
+                    status, created_by, created_at)
+                   VALUES(?,?,?,?,?, 'pending', ?, ?)""",
+                (request_no, item_id, expected_version, target, reason, actor, now),
+            )
+
+    def get_rollback_request(self, request_no: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM rollback_requests WHERE request_no=?", (request_no,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_rollback_request(self, request_no: str, expected_version: Optional[int] = None,
+                                 status: Optional[str] = None) -> None:
+        now = utc_now()
+        fields: List[str] = []
+        params: List[Any] = []
+        if expected_version is not None:
+            fields.append("expected_version=?"); params.append(expected_version)
+        if status is not None:
+            fields.append("status=?"); params.append(status)
+            if status == "committed":
+                fields.append("committed_at=?"); params.append(now)
+        if not fields:
+            return
+        params.append(request_no)
+        with self._lock, self.conn:
+            self.conn.execute(
+                f"UPDATE rollback_requests SET {', '.join(fields)} WHERE request_no=?",
+                params,
+            )
+
+    def apply_rollback(self, item_id: int, target: str, expected_version: int,
+                       request_no: str) -> tuple:
+        """原子完成：版本核对、作废派生记录、生成新版本、标记请求已提交。
+
+        任一环节失败则整体回滚，请求保持 pending 以便从检查点恢复。
+        返回 (更新后的item, 本次作废的派生记录列表)。
+        """
+        now = utc_now()
+        placeholders = ",".join("?" for _ in DERIVED_KINDS)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (target, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("项目不存在")
+                row = self.conn.execute(
+                    "SELECT version FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                raise ConflictError(
+                    f"版本冲突，当前版本为{row['version']}，请刷新后重试")
+            # 作废派生记录（关闭签认、资源释放），并生成记录新版本
+            self.conn.execute(
+                f"""UPDATE records SET status='voided', version=version+1
+                    WHERE item_id=? AND kind IN ({placeholders})
+                      AND status != 'voided'""",
+                (item_id, *DERIVED_KINDS),
+            )
+            voided = self.conn.execute(
+                f"""SELECT * FROM records
+                    WHERE item_id=? AND kind IN ({placeholders}) AND status='voided'
+                    ORDER BY id""",
+                (item_id, *DERIVED_KINDS),
+            ).fetchall()
+            item_row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            result_version = item_row["version"]
+            self.conn.execute(
+                """UPDATE rollback_requests
+                   SET status='committed', committed_at=?, result_version=?
+                   WHERE request_no=?""",
+                (now, result_version, request_no),
+            )
+        return dict(item_row), [dict(r) for r in voided]
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
