@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, DERIVED_RECORD_KINDS, ENTITY,
+                    RECORD_ROLES, ROLLBACK_ROLES, STATES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    validate_rollback, validate_transition)
 
 
 class Service:
@@ -74,6 +76,109 @@ class Service:
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def rollback(self, item_id: int, payload: Dict[str, Any], actor: str,
+                 role: str) -> Dict[str, Any]:
+        """回退补偿：带误判依据与期望版本提交，逐项核对后作废派生记录并生成新版本。
+
+        按请求编号幂等：已完成的请求重放原结果，重复只算一次；失败请求
+        保留检查点，拿着新版本重办。
+        """
+        ensure_role(role, ROLLBACK_ROLES)
+        actor = require_text(actor, "actor", 100)
+        request_id = require_text(payload.get("request_id"), "request_id", 100)
+        reason = require_text(payload.get("reason"), "reason")
+        target = payload.get("target_status")
+        if target not in STATES:
+            raise ValidationError("未知目标状态")
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+        req = self.repository.get_rollback_request(request_id)
+        if req is None:
+            item = self.repository.get_item(item_id)
+            validate_rollback(item["status"], target)
+            try:
+                req = self.repository.create_rollback_request(
+                    request_id, item_id, reason, expected_version, target, actor)
+            except ConflictError:
+                req = self.repository.get_rollback_request(request_id)
+        if req["item_id"] != item_id:
+            raise ConflictError("请求编号已被其他事件使用")
+        if req["status"] == "completed":
+            return req["result"]
+        if req["status"] == "failed":
+            req = self.repository.reopen_rollback_request(
+                request_id, reason, expected_version, target)
+        return self._execute_rollback(req)
+
+    def _execute_rollback(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = req["item_id"]
+        request_id = req["request_id"]
+        checkpoint = dict(req["checkpoint"])
+        if not checkpoint.get("compensation_done"):
+            item = self.repository.get_item(item_id)
+            validate_rollback(item["status"], req["target_status"])
+            checks = self._rollback_checks(item_id)
+            void_ids = checks["closure_signoffs"] + checks["resource_releases"]
+            checkpoint.update(from_status=item["status"], checks=checks,
+                              voided_record_ids=void_ids)
+            self.repository.save_checkpoint(request_id, checkpoint)
+            done_checkpoint = dict(checkpoint, compensation_done=True,
+                                   new_version=req["expected_version"] + 1)
+            try:
+                item = self.repository.apply_rollback(
+                    request_id, item_id, req["target_status"],
+                    req["expected_version"], void_ids, req["reason"],
+                    done_checkpoint)
+            except ConflictError as exc:
+                self.repository.fail_rollback_request(request_id, str(exc))
+                final = self.repository.get_rollback_request(request_id)
+                if final["status"] == "completed":
+                    return final["result"]
+                raise
+            checkpoint = done_checkpoint
+        if not checkpoint.get("audit_done"):
+            item = self.repository.get_item(item_id)
+            self.repository.append_rollback_audit(request_id, ENTITY, item_id,
+                                                  req["actor"], {
+                "request_id": request_id,
+                "reason": req["reason"],
+                "from": checkpoint["from_status"],
+                "to": req["target_status"],
+                "expected_version": req["expected_version"],
+                "new_version": checkpoint["new_version"],
+                "checks": checkpoint["checks"],
+                "voided_records": checkpoint["voided_record_ids"],
+            }, dict(checkpoint, audit_done=True))
+            checkpoint["audit_done"] = True
+        item = self.repository.get_item(item_id)
+        result = {
+            "request_id": request_id,
+            "item_id": item_id,
+            "reason": req["reason"],
+            "from_status": checkpoint["from_status"],
+            "to_status": req["target_status"],
+            "expected_version": req["expected_version"],
+            "new_version": checkpoint["new_version"],
+            "checks": checkpoint["checks"],
+            "voided_records": checkpoint["voided_record_ids"],
+            "item": self.enrich(item),
+        }
+        self.repository.complete_rollback_request(request_id, result)
+        return result
+
+    def _rollback_checks(self, item_id: int) -> Dict[str, Any]:
+        """逐项核对关闭签认、未结事项和资源释放，作废前留痕。"""
+        records = self.repository.list_records(item_id)
+        live = [r for r in records if not r.get("voided_at")]
+        return {
+            "closure_signoffs": [r["id"] for r in live
+                                 if r["kind"] == DERIVED_RECORD_KINDS[0]],
+            "resource_releases": [r["id"] for r in live
+                                  if r["kind"] == DERIVED_RECORD_KINDS[1]],
+            "open_items": [r["id"] for r in live if r["status"] == "open"],
+        }
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
